@@ -88,13 +88,50 @@ the bot's workspace (the bot, kept warm by keepalive, already eats ~720h of
 its own account's 750h — a second warm service THERE would suspend the bot
 around day 21 of the month. Don't co-locate them.)
 
+### LIVE-FIRE VERDICT (2026-11-16, deployed on the second account)
+
+The service deploys cleanly and every safety mechanism works on Render
+free — but **the mint itself does not fit in 512MB**. Measured live:
+
+| Gauge | Value |
+| --- | --- |
+| baseline, browser down (`/health`) | **48MB** (python + uvicorn) |
+| baseline, driver spawned, browser down | **166MB** (python + patchright node driver — matches the lab floor) |
+| mint peak, cold `/solve` | **534MB** → rss-guard honest-abort at 460MB, 18.5s |
+| mint peak, warm `/solve` | **537MB** → same honest abort, 7.8s |
+| squeeze (heap 128, viewport 640x480, BackForwardCache/Translate off) | **−0 effect** — cold 539MB / warm 537MB |
+| idle-kill after mints | verified live: 435 → 166MB, browser `down` |
+
+Why the squeeze fails: the weight is **not the V8 heap** — it's chromium's
+rendering arenas plus **Turnstile's WASM module** (linear memory sits
+outside `--max-old-space-size`). Heap caps can't reach it, and the only
+bigger lever (headless-shell instead of full chromium) is a stealth trade
+this repo deliberately refuses (Wall #2 odds first).
+
+**What this means operationally:**
+
+- Render free = safe but **no completed mints**: every call honest-fails in
+  ~8-19s and the lane falls through to the paid chain. Keep
+  `BX_SOLVER_URL` **unset** in Vercel — wiring it would add ~18s of wasted
+  latency to every lootlabs solve. The deployed service costs $0 and works
+  as a live canary (gauges, guard, lifecycle all proven).
+- The real fix is **RAM, not tuning**: run the solver on a substrate with
+  ≥1GB — a machine you own (free, residential egress = best Wall #2 odds,
+  `install.sh`) or any ≥1GB VPS/box. The same repo deploys unchanged.
+  On Render itself that means flipping this service to a bigger instance
+  type on the solver account (same repo, one dropdown — the render-free
+  profile only activates the safety rails, it never hurts a bigger box).
+- If you keep the free service as a canary: expect the honest-fail guard
+  every time (`ok:false, "rss-guard: …"`) — that is the system working,
+  not an outage.
+
 `BX_RENDER_FREE=1` shrinks the runtime to fit:
 
 | Mechanism | Effect |
 | --- | --- |
 | concurrency forced to 1 | 0.1 CPU + 512MB: one mint at a time |
 | browser torn down after 75s idle (`BX_BROWSER_IDLE_KILL_S`) | baseline drops to ~165MB (python + patchright driver); the browser exists only during mints |
-| 800x600 viewport, `--js-flags=--max-old-space-size=192`, `--renderer-process-limit=1`, `--disable-gpu` | lighter renderers |
+| 640x480 viewport, `--js-flags=--max-old-space-size=128`, `--renderer-process-limit=1`, `--disable-gpu`, BackForwardCache/Translate off | lighter renderers (note: live-fire showed the mint still exceeds 512MB — see the verdict above) |
 | **RSS mint guard** (`BX_RSS_ABORT_MB`, default 460) | aborts the mint honestly (`"error":"rss-guard: tree hit …MB"`) BEFORE the 512MB cgroup OOM-kills the service — an honest fail lets the lane fall through to the paid chain; an OOM restart would drop the in-flight lane call instead |
 | `/health` gauges | `rss_mb` (whole-tree PSS — the cgroup-style number), `stats.peak_rss_mb`, `rss_guard_mb` — Render free has no shell, these are your eyes |
 | `PORT` env precedence | binds what Render injects |
@@ -119,7 +156,9 @@ Deploy click-path (Render dashboard):
    + `BX_SOLVER_TOKEN` → LEG -1 + the selfsolver provider activate on the
    next deploy. Kill switch unchanged: `BX_SOLVER_URL=off`.
 
-First-fire checklist (the two live unknowns the sandbox cannot answer):
+First-fire checklist (RE-ANSWERED 2026-11-16 on the deployed free service —
+kept here for the next substrate; see the verdict above for the free-tier
+answers):
 
 ```bash
 curl -s https://<service>.onrender.com/health        # rss_mb baseline ~165
@@ -137,10 +176,13 @@ curl -s https://<service>.onrender.com/walk -H "Authorization: Bearer $TOKEN" \
   response tells you immediately).
 - **Wall #2**: Render's shared datacenter egress IPs are the same gamble
   every remote solver takes; the widget's own error text in `diag` gives the
-  silent-reject verdict on the first live mint.
+  silent-reject verdict on the first live mint. (Never reached on free —
+  the RSS wall fires first.)
 - If you see OOM restarts in Render logs → lower `BX_RSS_ABORT_MB` (460→420);
   if the guard trips on healthy mints → raise it (460→490). `/health`
-  `stats.peak_rss_mb` is the tuning oracle.
+  `stats.peak_rss_mb` is the tuning oracle. On ≥1GB substrates set
+  `BX_RENDER_FREE=0` (or unset it) — the guard stays off and concurrency
+  returns to normal.
 
 ## Wire into the lane (Vercel env, zero code changes needed)
 
