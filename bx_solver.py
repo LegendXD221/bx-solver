@@ -39,7 +39,7 @@ Env:
                      to 104.18.17.146 (IPv4-only hosts need this)
   BX_RENDER_FREE     0 (default) | 1 — Render free-tier profile (512MB RAM /
                      0.1 CPU): memory-trimmed chromium, concurrency forced to
-                     1, 800x600 viewport, browser torn down after
+                     1, 640x480 viewport, browser torn down after
                      BX_BROWSER_IDLE_KILL_S idle (default 75)
   BX_RSS_ABORT_MB    render-free mint guard: abort the mint (honest fail,
                      lane falls through) if the whole tree exceeds this MB —
@@ -197,9 +197,10 @@ class BrowserPool:
         if RENDER_FREE:
             # 512MB box: cap the JS heap, single renderer, no GPU pipeline.
             args += [
-                "--js-flags=--max-old-space-size=192",
+                "--js-flags=--max-old-space-size=128",
                 "--renderer-process-limit=1",
                 "--disable-gpu",
+                "--disable-features=BackForwardCache,Translate",
             ]
         return args
 
@@ -244,7 +245,7 @@ class BrowserPool:
 
     async def context(self):
         browser = await self.browser()
-        vw, vh = (800, 600) if RENDER_FREE else (1280, 720)
+        vw, vh = (640, 480) if RENDER_FREE else (1280, 720)
         return await browser.new_context(
             locale="en-US",
             viewport={"width": vw, "height": vh},
