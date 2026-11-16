@@ -1,0 +1,22 @@
+[Unit]
+Description=bx-solver — self-hosted Turnstile mint service (patchright)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=bx-solver
+Group=bx-solver
+WorkingDirectory=/opt/bx-solver
+EnvironmentFile=/etc/bx-solver.env
+ExecStart=/opt/bx-solver/venv/bin/python /opt/bx-solver/bx_solver.py
+Restart=always
+RestartSec=3
+# 2 concurrent chromium contexts fit comfortably; a runaway mint gets killed
+# before it can OOM the box (Oracle free ARM: 24GB, this is just a guardrail)
+MemoryMax=2500M
+KillSignal=SIGINT
+TimeoutStopSec=15
+
+[Install]
+WantedBy=multi-user.target
