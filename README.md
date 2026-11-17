@@ -16,16 +16,44 @@ and the same service runs unchanged on any owned box or VPS.
 | --- | --- | --- |
 | `POST /solve` | Generic mint: minimal widget page rendered **at the real origin** of `url` (document fulfilled locally, browser still talks to the real site) with the exact sitekey/action/cdata binding | ~2-8s |
 | `POST /walk` | Real-page walk: loads the actual captcha URL, the page's **own** widget mints (binding + hostname honored by construction — the same principle as the scrape.do walk leg, but on our hardware = $0) | ~5-30s |
-| `GET /health` | Liveness + counters | instant |
+| `GET /health` | Liveness + counters (v2 stats: avg_ms, busy 429s, retries, recycles, mints_since_launch) | instant |
+| `GET`/`POST /warm` | Idempotent browser prelaunch (also runs automatically at boot when `BX_WARMUP=1`) | instant |
 
 Auth: when `BX_SOLVER_TOKEN` is set, send `Authorization: Bearer <token>`.
+
+## v2 hardening (2026-11-17, live on the Altare box)
+
+- **Warm browser at boot** (`BX_WARMUP=1`, standard profile): the first mint
+  after any restart no longer pays the ~4s cold start — the browser launches
+  in a background task the moment the process comes up (~1.7s) and mints land
+  in ~3.5-4s from the internet.
+- **Bounded queue** (`BX_QUEUE_WAIT_S`, default 12): a burst no longer parks
+  callers on the semaphore until their own abort fires — past the wait the
+  endpoint returns an honest `429 {"ok":false,"error":"solver busy …"}` and
+  the calling lane falls through to the next provider immediately.
+- **One retry within budget** (`BX_RETRY=1`, default): the transient dry round
+  (widget loaded, nothing minted before the deadline — observed live on the
+  walk leg) re-attempts with the REMAINING budget (attempt 1 gets 65%, the
+  retry gets the rest; the response carries `"attempts":2`). Deterministic
+  failures (shape mismatch, widget error callback) never retry.
+- **Browser recycle** (`BX_BROWSER_RECYCLE_MINTS`, default 40): the chromium
+  process relaunches in the background after N mints so RSS stays flat over
+  long uptimes — the next mint hits the already-relaunched browser.
+- **RSS guard on big boxes** (`BX_RSS_ABORT_MB`, default 4600 non-render-free):
+  on a memory-capped cgroup the mint aborts honestly before the OOM-kill
+  would drop in-flight lane calls.
+
+```bash
+# NEW in v2: response carries attempts; /health carries version + queue + recycle state
+# {"ok":true,"token":"1.…","ms":3500,"mode":"solve","attempts":1}
+```
 
 ```bash
 # generic mint with full per-task binding
 curl -s http://VPS:8787/solve -H "Authorization: Bearer $TOKEN" \
   -H 'content-type: application/json' \
   -d '{"sitekey":"0x4AAAAAAEO6tvECK-X4VCvq","url":"https://…/captcha?urid=…","action":"unlock","cdata":"…"}'
-# → {"ok":true,"token":"1.….","ms":4300,"mode":"solve"}
+# → {"ok":true,"token":"1.….","ms":4300,"mode":"solve","attempts":1}
 
 # real-page walk (lootlabs captcha URL straight from the lane)
 curl -s http://VPS:8787/walk -H "Authorization: Bearer $TOKEN" \
