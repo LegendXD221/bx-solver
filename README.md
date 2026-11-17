@@ -4,11 +4,21 @@ A tiny HTTP service that mints Cloudflare Turnstile tokens with a stealth
 browser (patchright + patched chromium) on hardware we own. Built from the
 2026-11-15 R&D conclusions: patchright stealth is proven (~1.2s zero-click
 mint on a neutral demo, headless AND headful), so the code is light — the
-*runtime* is browser-class (~400-600MB RAM) and on an IPv4-only host the
-IPv6-only challenge host needs `BX_BRUNHILD_PIN=1`. This repo is
-self-contained and public on purpose: Render can build and run it straight
-from this repo on the free tier (see the `BX_RENDER_FREE=1` profile below),
-and the same service runs unchanged on any owned box or VPS.
+*runtime* is browser-class (~400-600MB RAM). This repo is self-contained and
+public on purpose: Render can build and run it straight from this repo on the
+free tier (see the `BX_RENDER_FREE=1` profile below), and the same service
+runs unchanged on any owned box or VPS.
+
+**The honest 2026-11-17 verdict (measured, see WORKLOG.md):** neutral/dummy
+sitekeys mint free forever. PRODUCTION sitekeys refuse self-hosted mints from
+a Linux datacenter box regardless of browser build (chromium/real-Chrome),
+head mode (headless/headful under Xvfb), or egress IP — unbound challenges die
+at the `/fo/` fingerprint submission (HTTP 400), cdata-bound ones run the full
+interactive challenge but completion never arrives (`/pat/` answers 401 — a
+client-class check that provider fleets satisfy). v3 therefore makes the
+service the **fast honest first leg**: every failure is classified
+(`failClass`) and doom-cached, so a doomed sitekey costs the calling lane
+~0.4s instead of a full 45s budget.
 
 ## Endpoints
 
@@ -16,7 +26,7 @@ and the same service runs unchanged on any owned box or VPS.
 | --- | --- | --- |
 | `POST /solve` | Generic mint: minimal widget page rendered **at the real origin** of `url` (document fulfilled locally, browser still talks to the real site) with the exact sitekey/action/cdata binding | ~2-8s |
 | `POST /walk` | Real-page walk: loads the actual captcha URL, the page's **own** widget mints (binding + hostname honored by construction — the same principle as the scrape.do walk leg, but on our hardware = $0) | ~5-30s |
-| `GET /health` | Liveness + counters (v2 stats: avg_ms, busy 429s, retries, recycles, mints_since_launch) | instant |
+| `GET /health` | Liveness + live metrics (p50/p95, inflight/queued, per-sitekey table, doom map, recent diags) | instant |
 | `GET`/`POST /warm` | Idempotent browser prelaunch (also runs automatically at boot when `BX_WARMUP=1`) | instant |
 
 Auth: when `BX_SOLVER_TOKEN` is set, send `Authorization: Bearer <token>`.
@@ -63,8 +73,44 @@ curl -s http://VPS:8787/walk -H "Authorization: Bearer $TOKEN" \
 ```
 
 On failure the response carries `error` with the **widget's own error text**
-("Could not load the check…", error-callback values) — that is what makes
-live-fire triage possible from the lane's honest-fail notes.
+("Could not load the check…", error-callback values), a machine-readable
+**`failClass`**, and an **`advice`** string — that is what makes live-fire
+triage and instant fall-through possible from the lane's honest-fail notes.
+
+## v3 (2026-11-17): failure classification + doom cache + warm context pool
+
+- **failClass** on every failed mint: `fo-reject` (4xx on the fingerprint
+  submission — dead challenge, detected EARLY, the loop aborts in seconds),
+  `interactive-stall` (challenge ran, click landed, completion refused — the
+  measured client-class wall), `widget-error`, `shape`, `driver`
+  (browser/context crashed — retryable), `transient` (dry round — retryable),
+  `rss-guard`, and `doom-cached` (see below).
+- **Per-sitekey doom cache** (`BX_DOOM_AFTER=2`, `BX_DOOM_TTL_S=1800`): after
+  2 consecutive deterministic failures for a sitekey, mints for it answer in
+  **<0.5s** with `failClass:"doom-cached"` until the TTL elapses — then ONE
+  full-budget re-probe keeps the system adaptive if Cloudflare ever relaxes
+  the wall. Walk-mode dooms are keyed by target host (walks carry no
+  sitekey); solve-mode by sitekey. `/health` exposes the live doom map.
+- **Warm context pool** (`BX_POOL_SIZE`, default = max_concurrent): contexts
+  are pre-created in the background and a mint borrows one — the ~0.5-1s
+  per-mint context setup leaves the critical path. Contexts stay single-use
+  (fingerprint hygiene); the pool refills itself.
+- **Live metrics**: `/health` carries p50/p95 over the last 20 successful
+  mints, inflight/queued counts, a per-sitekey table (ok/fail/classes/
+  fastfails/p50/p95), browser age, and the last 20 diag events.
+- **Retry hardening**: `driver`-class failures (browser died mid-mint, e.g.
+  during a background recycle) retry on a fresh context within the remaining
+  budget; transient dry rounds keep the v2 65/35 budget split; classified
+  deterministic failures never retry.
+- **Optional proxy passthrough** (`BX_PROXY="http://host:port|user|pass"` env
+  or per-request `"proxy": {...}`): routes the mint context through an HTTP
+  proxy. EXPERIMENTAL — measured 2026-11-17 to NOT unlock the LootLabs wall
+  (challenge assets misbehave through the MITM tunnel); kept for
+  lenient-sitekey scenarios where egress reputation matters.
+- **`BX_BRUNHILD_PIN` is obsolete**: brunhild.challenges.cloudflare.com left
+  DNS entirely (2026-11-17, both A and AAAA empty) and the real widget never
+  contacts it — everything rides challenges.cloudflare.com (dual-stack). The
+  env knob is kept only so old env files don't break; the MAP rule is inert.
 
 ## Deploy (any always-on box — Oracle NOT required)
 
@@ -74,10 +120,13 @@ chromium && python bx_solver.py` on Windows/mac). What actually matters for
 Turnstile is the **egress**, not the cloud brand:
 
 - **Wall #2 — IP reputation**: residential > datacenter. A home connection
-  is the best free substrate that exists.
-- **Wall #1 — the IPv6-only challenge host**: native dual-stack is ideal;
-  on an IPv4-only host just set `BX_BRUNHILD_PIN=1` (proven transport fix —
-  the pin ships in the service, default 0).
+  is the best free substrate that exists. (Measured 2026-11-17: even a clean
+  datacenter egress cannot complete PRODUCTION sitekeys — the client-class
+  check refuses Linux-datacenter completions regardless of IP; neutral
+  sitekeys mint fine everywhere.)
+- **Wall #1 — retired**: brunhild.challenges.cloudflare.com left DNS entirely
+  (2026-11-17) and the widget never contacts it — everything rides
+  challenges.cloudflare.com, which is dual-stack and reachable from any host.
 
 **Option 1 — a machine you own (recommended: residential IP, $0):**
 
@@ -88,9 +137,10 @@ cloudflared tunnel --url http://127.0.0.1:8787      # quick URL (testing)
 # or a named tunnel on your own domain for a stable URL
 ```
 
-**Option 2 — cheap VPS ($3-6/mo):** same `install.sh`; add
-`BX_BRUNHILD_PIN=1` if the box is IPv4-only. Datacenter-IP reputation is the
-same gamble every remote solver takes.
+**Option 2 — cheap VPS ($3-6/mo):** same `install.sh`. Datacenter-IP
+reputation is the same gamble every remote solver takes — and for production
+sitekeys v3's doom cache makes the failure cheap and honest (fast-fail +
+failClass instead of a silent 45s burn).
 
 **Option 3 — Oracle Always-Free ARM:** also works (dual-stack, $0) —
 `install.sh` was written for Ubuntu ARM64 as-is. Requires enabling IPv6 in
